@@ -8,7 +8,7 @@ import {
   REST,
   Routes,
 } from 'discord.js';
-import { translate } from '@vitalets/google-translate-api';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import express from 'express';
 
 // ---------------------------------------------------------------------------
@@ -32,7 +32,12 @@ const FLAG_LANG_MAP = {
 };
 
 // ---------------------------------------------------------------------------
-// Keep-alive Express server (required for Render Web Service)
+// Khởi tạo Gemini AI
+// ---------------------------------------------------------------------------
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+// ---------------------------------------------------------------------------
+// Keep-alive Express server (Bắt buộc cho Render Web Service)
 // ---------------------------------------------------------------------------
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -72,7 +77,9 @@ client.once('ready', async () => {
   }
 });
 
-// Message Context Menu: "Translate to VN" (Ephemeral Mode)
+// ---------------------------------------------------------------------------
+// Context Menu: Dịch tàng hình (Không làm rác kênh chat)
+// ---------------------------------------------------------------------------
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isMessageContextMenuCommand()) return;
   if (interaction.commandName !== 'Translate to VN') return;
@@ -81,7 +88,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (!originalText) {
     return interaction.reply({
-      content: ' Tin nhắn này không có văn bản để dịch.',
+      content: '⚠️ Tin nhắn này không có văn bản để dịch.',
       ephemeral: true,
     });
   }
@@ -89,16 +96,19 @@ client.on('interactionCreate', async (interaction) => {
   await interaction.deferReply({ ephemeral: true });
 
   try {
-    const result = await translate(originalText, { to: 'vi' });
-    await interaction.editReply(`🇻🇳 **Dịch sang tiếng Việt:**\n${result.text}`);
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const prompt = `Dịch đoạn văn bản sau sang tiếng Việt một cách tự nhiên nhất. Chỉ trả về kết quả dịch, không giải thích gì thêm: "${originalText}"`;
+    const result = await model.generateContent(prompt);
+    
+    await interaction.editReply(`🇻🇳 **Bản dịch:**\n${result.response.text().trim()}`);
   } catch (err) {
-    console.error('[Error] Translation failed:', err);
+    console.error('[Error] Context Menu Translate failed:', err);
     await interaction.editReply('Lỗi dịch thuật. Vui lòng thử lại sau.');
   }
 });
 
 // ---------------------------------------------------------------------------
-// Reaction Event: Dịch ngay tại kênh chat & TỰ HỦY SAU 20 GIÂY
+// Reaction Event: Dịch bằng AI & Tự hủy sau 10 giây
 // ---------------------------------------------------------------------------
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;
@@ -120,19 +130,21 @@ client.on('messageReactionAdd', async (reaction, user) => {
   if (!originalText) return;
 
   try {
-    const result = await translate(originalText, { to: targetLang });
+    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    const prompt = `Translate the following text to the language with ISO code '${targetLang}'. Provide ONLY the translation, keep the tone natural, keep any emojis, and do not add any explanations: "${originalText}"`;
     
-    // Gửi tin nhắn trả lời thẳng vào kênh chat kèm thông báo đếm ngược
+    const result = await model.generateContent(prompt);
+    const translatedText = result.response.text().trim();
+    
+    // Gửi tin nhắn trả lời thẳng vào kênh chat kèm thông báo đếm ngược 10s
     const replyMsg = await reaction.message.reply({
-      content: `Gửi <@${user.id}>, this message will **be deleted in 10s** \n\n${emoji} **(${targetLang}):**\n${result.text}`,
-      // Không ping người dùng để tránh làm phiền (họ vẫn thấy tag tên nhưng không bị kêu Ting)
+      content: `Gửi <@${user.id}>, this message will **be deleted in 10s** ⏳\n\n${emoji} **(${targetLang}):**\n${translatedText}`,
       allowedMentions: { repliedUser: false } 
     });
 
-    // Cài đặt bộ đếm giờ (10000 mili-giây = 10 giây) để xóa tin nhắn
+    // Xóa tin nhắn sau 10 giây (10000 mili-giây)
     setTimeout(async () => {
       try {
-        // Kiểm tra xem tin nhắn còn tồn tại không rồi mới xóa (tránh lỗi crash bot)
         if (replyMsg && replyMsg.deletable) {
           await replyMsg.delete();
         }
@@ -142,7 +154,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
     }, 10000);
 
   } catch (err) {
-    console.error('[Error] Translation failed:', err);
+    console.error('[Error] Reaction Translation failed:', err);
   }
 });
 
