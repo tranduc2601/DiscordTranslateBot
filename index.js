@@ -9,7 +9,6 @@ import {
   Routes,
   MessageFlags
 } from 'discord.js';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import express from 'express';
 
 const FLAG_LANG_MAP = {
@@ -29,10 +28,9 @@ const FLAG_LANG_MAP = {
   '🇺🇿': 'uz', '🇻🇳': 'vi', '🇿🇦': 'af',
 };
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-let workingModelName = ""; // Sẽ tự động tìm model khi bot chạy
+// API GOOGLE BẤT TỬ CỦA BẠN (Giữ nguyên)
+const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbynmQBZAkl39sBoj6GzmMhSqjTYsnobBREIlaxIgrTAP0M2hXEM1vSwXu1WfGzPvYC8Qw/exec";
 
-// --- Server Keep-alive ---
 const app = express();
 app.get('/', (_req, res) => res.send('Bot is running!'));
 app.listen(process.env.PORT || 3000);
@@ -42,48 +40,57 @@ const client = new Client({
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-// HÀM TỰ ĐỘNG TÌM MODEL "SỐNG"
-async function findWorkingModel() {
-    try {
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${process.env.GEMINI_API_KEY}`);
-        const data = await response.json();
-        const models = data.models || [];
-        // Ưu tiên tìm model có chữ 'flash', nếu không lấy cái đầu tiên hỗ trợ generateContent
-        const bestModel = models.find(m => m.name.includes('flash') && m.supportedGenerationMethods.includes('generateContent')) 
-                        || models.find(m => m.supportedGenerationMethods.includes('generateContent'));
-        
-        if (bestModel) {
-            workingModelName = bestModel.name.replace('models/', '');
-            console.log(`✅ Đã tìm thấy model hoạt động: ${workingModelName}`);
-            return true;
-        }
-        return false;
-    } catch (e) {
-        console.error("❌ Không thể lấy danh sách model:", e.message);
-        return false;
-    }
-}
-
 client.once('clientReady', async () => {
   console.log(`[Discord] Logged in as ${client.user.tag}`);
-  const hasModel = await findWorkingModel();
-  if (!hasModel) console.error("⚠️ CẢNH BÁO: Không tìm thấy model nào khả dụng trong tài khoản này!");
-
   const command = new ContextMenuCommandBuilder().setName('Translate to VN').setType(ApplicationCommandType.Message);
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  try {
-    await rest.put(Routes.applicationCommands(client.user.id), { body: [command.toJSON()] });
-    console.log('[Discord] Registered command: Translate to VN');
-  } catch (err) { console.error('[Error] Command reg failed:', err); }
+  try { await rest.put(Routes.applicationCommands(client.user.id), { body: [command.toJSON()] }); } catch (err) {}
 });
 
-async function translateText(text, targetLang) {
-    if (!workingModelName) throw new Error("Chưa xác định được model hoạt động.");
-    const model = genAI.getGenerativeModel({ model: workingModelName });
-    const result = await model.generateContent(`Translate to ISO code '${targetLang}', output only translation: "${text}"`);
-    return result.response.text().trim();
+// HỆ THỐNG XẾP HÀNG CHỐNG CRASH
+let isTranslating = false;
+const translateQueue = [];
+const activeTranslations = new Set(); // Bộ nhớ chống ấn trùng
+
+async function processQueue() {
+    if (isTranslating || translateQueue.length === 0) return;
+    isTranslating = true;
+    const { text, targetLang, resolve, reject } = translateQueue.shift();
+
+    try {
+        const response = await fetch(GOOGLE_SCRIPT_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: text, target: targetLang })
+        });
+        const translatedText = await response.text();
+        resolve(translatedText);
+    } catch (e) { reject(e); }
+
+    setTimeout(() => {
+        isTranslating = false;
+        processQueue();
+    }, 1000);
 }
 
+function translateText(text, targetLang) {
+    return new Promise((resolve, reject) => {
+        translateQueue.push({ text, targetLang, resolve, reject });
+        processQueue();
+    });
+}
+
+function getNativeLangName(langCode) {
+    try {
+        let code = langCode;
+        if (code === 'zh-CN') code = 'zh-Hans';
+        if (code === 'zh-TW') code = 'zh-Hant';
+        const name = new Intl.DisplayNames([code], { type: 'language' }).of(code);
+        return name.charAt(0).toUpperCase() + name.slice(1);
+    } catch (e) { return langCode.toUpperCase(); }
+}
+
+// LỆNH CHUỘT PHẢI
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isMessageContextMenuCommand() || interaction.commandName !== 'Translate to VN') return;
   const originalText = interaction.targetMessage.content?.trim();
@@ -93,29 +100,78 @@ client.on('interactionCreate', async (interaction) => {
   try {
     const translated = await translateText(originalText, 'vi');
     await interaction.editReply(`🇻🇳 **Bản dịch:**\n${translated}`);
-  } catch (err) {
-    console.error('[LỖI]:', err.message);
-    await interaction.editReply(`⚠️ Lỗi: ${err.message}`);
-  }
+  } catch (err) { await interaction.editReply('⚠️ Lỗi dịch thuật.'); }
 });
 
+// =========================================================
+// LỆNH THẢ CỜ - TẠO CHỦ ĐỀ ẨN & TRẢ LẠI KÊNH CHAT SẠCH SẼ
+// =========================================================
 client.on('messageReactionAdd', async (reaction, user) => {
   if (user.bot) return;
   if (reaction.partial) await reaction.fetch().catch(() => null);
-  if (reaction.message.partial) await reaction.message.fetch().catch(() => null);
+  
+  const message = reaction.message;
+  if (message.partial) await message.fetch().catch(() => null);
 
-  const targetLang = FLAG_LANG_MAP[reaction.emoji.name];
-  const originalText = reaction.message.content?.trim();
+  const emoji = reaction.emoji.name;
+  const targetLang = FLAG_LANG_MAP[emoji];
+  const originalText = message.content?.trim();
+  
   if (!targetLang || !originalText) return;
+
+  // 1. KIỂM TRA CHỐNG DỊCH TRÙNG (Chuyển họ sang Chủ đề đã có)
+  const lockKey = `${message.id}-${targetLang}`;
+  const botReacted = message.reactions.cache.get(emoji)?.me;
+  
+  if (botReacted || activeTranslations.has(lockKey)) {
+      const warnMsg = await message.reply({
+          content: `⚠️ <@${user.id}>, ngôn ngữ ${emoji} đã được dịch rồi! Hãy nhấn vào biểu tượng **Chủ đề (Thread)** dưới tin nhắn gốc để xem lại nhé.`,
+          allowedMentions: { repliedUser: false }
+      });
+      // Trả lại kênh chat sạch sẽ sau 10s
+      setTimeout(() => warnMsg.delete().catch(() => null), 10000);
+      return; // CẮT LUỒNG, KHÔNG DỊCH LẠI ĐỂ CHỐNG CRASH
+  }
+
+  activeTranslations.add(lockKey);
 
   try {
     const translated = await translateText(originalText, targetLang);
-    const replyMsg = await reaction.message.reply({
-      content: `Gửi <@${user.id}>, bản dịch tự xóa sau 10s ⏳\n\n${reaction.emoji.name} **(${targetLang}):**\n${translated}`,
-      allowedMentions: { repliedUser: false } 
+    const langName = getNativeLangName(targetLang); 
+    
+    // 2. TẠO HOẶC LẤY CHỦ ĐỀ (THREAD)
+    let thread = message.thread;
+    if (!thread) {
+        thread = await message.startThread({
+            name: `🌐 Bản dịch / Translations`,
+            autoArchiveDuration: 60,
+            reason: 'Lưu trữ bản dịch tự động'
+        });
+    } else if (thread.archived) {
+        await thread.setArchived(false); // Mở lại tạm thời nếu Thread đã bị đóng
+    }
+
+    // 3. GỬI BẢN DỊCH VÀO CHỦ ĐỀ (Dùng Username, KHÔNG PING để tránh vướng cột trái)
+    await thread.send(`${emoji} **${langName}:**\n*Người yêu cầu: ${user.username}*\n\n${translated}`);
+
+    // 4. ĐÓNG (ARCHIVE) CHỦ ĐỀ NGAY LẬP TỨC ĐỂ ẨN NÓ KHỎI CỘT BÊN TRÁI CỦA MỌI NGƯỜI
+    await thread.setArchived(true);
+
+    // 5. BOT THẢ CỜ ĐỂ ĐÁNH DẤU
+    await message.react(emoji);
+
+    // 6. THÔNG BÁO CHO NGƯỜI DÙNG & TỰ XÓA SAU 10S (TRẢ KÊNH CHAT SẠCH BONG)
+    const replyMsg = await message.reply({
+        content: `✅ <@${user.id}>, đã dịch sang ${emoji}. Bản dịch đã được lưu gọn gàng trong **Chủ đề** bên dưới. Tin nhắn này sẽ tự xóa sau 10s ⏳`,
+        allowedMentions: { repliedUser: false }
     });
     setTimeout(() => replyMsg.delete().catch(() => null), 10000);
-  } catch (err) { console.error('[LỖI THẢ CỜ]:', err.message); }
+
+  } catch (err) { 
+    console.error('[LỖI THẢ CỜ]:', err.message);
+  } finally {
+    activeTranslations.delete(lockKey);
+  }
 });
 
 client.login(process.env.DISCORD_TOKEN);
